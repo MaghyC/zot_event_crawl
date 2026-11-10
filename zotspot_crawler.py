@@ -14,6 +14,7 @@ POLITE CRAWLING:
 import json
 import time
 import random
+import base64
 import requests
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
@@ -28,6 +29,27 @@ DEFAULT_DELAY = 2.0        # seconds between requests (polite default)
 MAX_DELAY = 60.0           # max backoff
 DEFAULT_MAX_PAGES = 10     # safety limit
 DEFAULT_TIMEOUT = 30       # request timeout
+BASE_URL = "https://zotspot.uci.edu"
+API_ENDPOINT = "/mobile_ws/v17/mobile_events_list"
+
+
+def to_absolute_url(url: str, base: str = BASE_URL) -> str:
+    """Convert relative URL to absolute URL."""
+    if not url:
+        return ""
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    if url.startswith("//"):
+        return "https:" + url
+    return urljoin(base + "/", url.lstrip("/"))
+
+
+def decode_cg_id(encoded: str) -> Optional[str]:
+    """Decode CampusGroups base64 ID (e.g., dWNpOkV2ZW50OjE5NDg3MjU= -> uci:Event:1948725)."""
+    try:
+        return base64.b64decode(encoded).decode('utf-8')
+    except Exception:
+        return None
 
 
 @dataclass
@@ -66,9 +88,9 @@ class ZotSpotCrawler:
         Initialize crawler.
 
         Args:
-            session_cookies: Dict of session cookies (e.g., from browser)
-            jwt_token: JWT token from window.cg.session.jwt
-            csrf_token: CSRF token from window.cg.session.csrf_token
+            session_cookies: Dict of session cookies (optional - API is public)
+            jwt_token: JWT token (optional - API is public)
+            csrf_token: CSRF token (optional - API is public)
             base_delay: Base delay between requests in seconds (default 2.0)
             max_delay: Maximum backoff delay in seconds (default 60.0)
             max_pages: Maximum pages to fetch as safety limit (default 10)
@@ -83,6 +105,7 @@ class ZotSpotCrawler:
             "Referer": "https://zotspot.uci.edu/events",
         })
 
+        # Optional auth - only needed for private data (RSVP, private locations, etc.)
         if session_cookies:
             self.session.cookies.update(session_cookies)
         if csrf_token:
@@ -233,8 +256,11 @@ class ZotSpotCrawler:
 
         events = []
         for item in data:
-            # Last item may contain counter metadata
-            if "counter" in item and "fields" in item:
+            # Skip separator/header items (listingSeparator="true" or p0="true")
+            if item.get("listingSeparator") == "true" or item.get("p0") == "true":
+                continue
+            # Skip counter metadata (has counter but no actual event fields)
+            if "counter" in item and "eventId" not in item.get("fields", ""):
                 continue
 
             event = self._parse_event(item)
@@ -255,22 +281,48 @@ class ZotSpotCrawler:
                 if key in item:
                     field_values[field_name] = item[key]
 
-            # Map common fields (adjust based on actual response)
+            # Convert relative URLs to absolute
+            event_url = to_absolute_url(field_values.get("eventUrl", ""))
+            event_url_logo = to_absolute_url(field_values.get("eventUrlLogo", ""))
+            event_url_title = to_absolute_url(field_values.get("eventUrlTitle", ""))
+            event_url_button = to_absolute_url(field_values.get("eventUrlButton", ""))
+            event_url_location = to_absolute_url(field_values.get("eventUrlLocation", ""))
+            image_url = to_absolute_url(field_values.get("eventPicture", ""))
+
+            # Decode CampusGroups internal ID if present
+            event_uid = field_values.get("eventUid", "")
+            decoded_uid = decode_cg_id(event_uid) if event_uid else None
+
+            # Map common fields
             event = ZotSpotEvent(
-                id=str(item.get("id", field_values.get("id", ""))),
-                title=field_values.get("title", field_values.get("name", "")),
-                description=field_values.get("description", field_values.get("desc", "")),
-                start_date=field_values.get("start_date", field_values.get("event_start", "")),
-                end_date=field_values.get("end_date", field_values.get("event_end", "")),
-                location=field_values.get("location", field_values.get("venue", "")),
-                group_name=field_values.get("group_name", field_values.get("organization", "")),
-                group_id=str(field_values.get("group_id", field_values.get("organization_id", ""))),
-                category=field_values.get("category", field_values.get("event_type", "")),
-                url=field_values.get("url", field_values.get("event_url", "")),
-                image_url=field_values.get("image_url", field_values.get("logo", "")),
-                rsvp_required=field_values.get("rsvp_required", "false").lower() == "true",
+                id=str(item.get("id", field_values.get("eventId", ""))),
+                title=field_values.get("eventName", field_values.get("name", "")),
+                description=field_values.get("eventFlyerDescription", field_values.get("eventPhotoDescription", "")),
+                start_date=field_values.get("eventDates", field_values.get("event_start", "")),
+                end_date="",  # Included in eventDates
+                location=field_values.get("eventLocation", field_values.get("venue", "")),
+                group_name=field_values.get("clubName", field_values.get("organization", "")),
+                group_id=str(field_values.get("clubId", field_values.get("organization_id", ""))),
+                category=field_values.get("eventCategory", field_values.get("event_type", "")),
+                url=event_url,
+                image_url=image_url,
+                rsvp_required=field_values.get("eventButtonLabel", "").lower() in ("register", "rsvp"),
                 raw_data=item
             )
+            # Add extra fields to raw_data for reference
+            event.raw_data["_parsed"] = {
+                "event_url": event_url,
+                "event_url_logo": event_url_logo,
+                "event_url_title": event_url_title,
+                "event_url_button": event_url_button,
+                "event_url_location": event_url_location,
+                "decoded_uid": decoded_uid,
+                "club_login": field_values.get("clubLogin", ""),
+                "event_price": field_values.get("eventPriceRange", ""),
+                "event_badges": field_values.get("eventBadges", ""),
+                "event_tags": field_values.get("eventTags", ""),
+                "timezone": field_values.get("eventTimezone", ""),
+            }
             return event
         except Exception as e:
             logger.warning(f"Failed to parse event: {e}")
@@ -342,7 +394,7 @@ class ZotSpotCrawler:
     def get_filter_options(self) -> Dict[str, List[Dict[str, str]]]:
         """Fetch available filter options (groups, categories, etc.)."""
         # These are typically in the HTML page - fetch and parse
-        url = f"{self.BASE_URL}/events"
+        url = f"{BASE_URL}/events"
         response = self.session.get(url)
         response.raise_for_status()
 
@@ -350,15 +402,69 @@ class ZotSpotCrawler:
         # This would require BeautifulSoup - left as exercise
         return {}
 
+    def fetch_event_details(self, event_url: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch detailed event information from the event page.
+
+        Args:
+            event_url: Absolute URL to event (e.g., https://zotspot.uci.edu/rsvp_boot?id=123456)
+
+        Returns:
+            Dict with detailed event info, or None if failed
+        """
+        if not event_url:
+            return None
+
+        logger.info(f"Fetching event details: {event_url}")
+        try:
+            response = self._polite_request(event_url)
+
+            # Parse HTML for details (requires BeautifulSoup)
+            # For now, return raw HTML
+            return {
+                "url": event_url,
+                "html": response.text,
+                "status": "success"
+            }
+        except Exception as e:
+            logger.warning(f"Failed to fetch event details: {e}")
+            return {"url": event_url, "error": str(e), "status": "failed"}
+
+    def crawl_event_details(self, events: List[ZotSpotEvent],
+                           max_details: Optional[int] = None) -> List[ZotSpotEvent]:
+        """
+        Fetch detailed info for each event (optional, slow).
+
+        Args:
+            events: List of events to enrich
+            max_details: Max number of events to fetch details for (None = all)
+
+        Returns:
+            Same events list with enriched raw_data
+        """
+        count = 0
+        for event in events:
+            if max_details and count >= max_details:
+                break
+
+            if event.url:
+                details = self.fetch_event_details(event.url)
+                if details:
+                    event.raw_data["details"] = details
+                count += 1
+
+        logger.info(f"Fetched details for {count} events")
+        return events
+
 
 def main():
     """Example usage."""
     import argparse
 
     parser = argparse.ArgumentParser(description="Crawl ZotSpot events (polite crawler)")
-    parser.add_argument("--cookies", help="Path to cookies JSON file")
-    parser.add_argument("--jwt", help="JWT token")
-    parser.add_argument("--csrf", help="CSRF token")
+    parser.add_argument("--cookies", help="Path to cookies JSON file (optional - API is public)")
+    parser.add_argument("--jwt", help="JWT token (optional)")
+    parser.add_argument("--csrf", help="CSRF token (optional)")
     parser.add_argument("--output", default="zotspot_events.json", help="Output file")
     parser.add_argument("--limit", type=int, default=50, help="Events per page")
     parser.add_argument("--max-pages", type=int, help="Max pages to crawl (default: 10)")
@@ -368,16 +474,17 @@ def main():
     parser.add_argument("--delay", type=float, default=2.0, help="Base delay between requests in seconds (default: 2.0)")
     parser.add_argument("--max-delay", type=float, default=60.0, help="Max backoff delay in seconds (default: 60.0)")
     parser.add_argument("--timeout", type=int, default=30, help="Request timeout in seconds (default: 30)")
+    parser.add_argument("--fetch-details", type=int, metavar="N", help="Fetch detail pages for first N events (slow!)")
 
     args = parser.parse_args()
 
-    # Load cookies if provided
+    # Load cookies if provided (optional)
     cookies = None
     if args.cookies:
         with open(args.cookies) as f:
             cookies = json.load(f)
 
-    # Initialize crawler with polite settings
+    # Initialize crawler with polite settings (auth optional)
     crawler = ZotSpotCrawler(
         session_cookies=cookies,
         jwt_token=args.jwt,
@@ -403,6 +510,11 @@ def main():
         max_pages=args.max_pages
     )
 
+    # Optionally fetch detail pages
+    if args.fetch_details:
+        logger.info(f"Fetching detail pages for {args.fetch_details} events...")
+        events = crawler.crawl_event_details(events, max_details=args.fetch_details)
+
     # Save
     crawler.save_events(events, args.output)
 
@@ -410,6 +522,7 @@ def main():
     print(f"\nCrawled {len(events)} events")
     for event in events[:5]:
         print(f"  - {event.title} ({event.start_date}) - {event.group_name}")
+        print(f"    URL: {event.url}")
 
 
 if __name__ == "__main__":
