@@ -27,8 +27,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DELAY = 2.0        # seconds between requests (polite default)
 MAX_DELAY = 60.0           # max backoff
-DEFAULT_MAX_PAGES = 10     # safety limit
+DEFAULT_MAX_PAGES = 15     # safety limit (435 events / 40 = ~11 pages)
 DEFAULT_TIMEOUT = 30       # request timeout
+DEFAULT_LIMIT = 40         # matches webpage pagination
 BASE_URL = "https://zotspot.uci.edu"
 API_ENDPOINT = "/mobile_ws/v17/mobile_events_list"
 
@@ -133,9 +134,11 @@ class ZotSpotCrawler:
             csrf_token=data.get("csrf_token")
         )
 
-    def _build_api_url(self, range_start: int = 0, limit: int = 50,
+    def _build_api_url(self, range_start: int = 0, limit: int = 40,
                        filters: Optional[Dict[str, str]] = None,
-                       order: str = "", search: str = "") -> str:
+                       order: str = "", search: str = "",
+                       include_all_events: bool = False,
+                       use_web_filters: bool = False) -> str:
         """Build the API URL with parameters."""
         params = {
             "range": str(range_start),
@@ -155,6 +158,18 @@ class ZotSpotCrawler:
                 params["filter4_contains"] = filters["filter4_contains"]
             if "filter4_notcontains" in filters:
                 params["filter4_notcontains"] = filters["filter4_notcontains"]
+
+        # If include_all_events is True, DON'T send filter1 (gets all events: upcoming + past)
+        # If include_all_events is False (default), send filter1="" to get "Upcoming" only
+        if not include_all_events:
+            params["filter1"] = ""
+
+        # Use web-like filters if requested (matches browser XHR)
+        if use_web_filters:
+            params.setdefault("filter4_contains", "OR")
+            params.setdefault("filter4_notcontains", "OR")
+            if not order:
+                params["order"] = "undefined"
 
         # Add timestamp to prevent caching
         params["_"] = str(int(time.time() * 1000))
@@ -236,26 +251,36 @@ class ZotSpotCrawler:
 
         raise requests.RequestException(f"Failed after {max_retries} attempts: {last_exception}")
 
-    def fetch_events_page(self, range_start: int = 0, limit: int = 50,
+    def fetch_events_page(self, range_start: int = 0, limit: int = 40,
                           filters: Optional[Dict[str, str]] = None,
-                          order: str = "", search: str = "") -> List[ZotSpotEvent]:
+                          order: str = "", search: str = "",
+                          include_all_events: bool = False,
+                          use_web_filters: bool = False) -> tuple[List[ZotSpotEvent], int]:
         """
         Fetch a single page of events.
 
         Returns:
-            List of ZotSpotEvent objects
+            Tuple of (List of ZotSpotEvent objects, total_count from API)
         """
-        url = self._build_api_url(range_start, limit, filters, order, search)
+        url = self._build_api_url(range_start, limit, filters, order, search, include_all_events, use_web_filters)
         logger.info(f"Fetching page (range={range_start}, limit={limit})")
 
         response = self._polite_request(url)
 
         data = response.json()
         if not data:
-            return []
+            return [], 0
 
         events = []
+        total_count = 0
         for item in data:
+            # Get total count from last item
+            if "counter" in item:
+                try:
+                    total_count = int(item["counter"])
+                except (ValueError, TypeError):
+                    pass
+
             # Skip separator/header items (listingSeparator="true" or p0="true")
             if item.get("listingSeparator") == "true" or item.get("p0") == "true":
                 continue
@@ -267,7 +292,7 @@ class ZotSpotCrawler:
             if event:
                 events.append(event)
 
-        return events
+        return events, total_count
 
     def _parse_event(self, item: Dict[str, Any]) -> Optional[ZotSpotEvent]:
         """Parse raw API response into ZotSpotEvent."""
@@ -328,21 +353,25 @@ class ZotSpotCrawler:
             logger.warning(f"Failed to parse event: {e}")
             return None
 
-    def crawl_all_events(self, limit_per_page: int = 50,
+    def crawl_all_events(self, limit_per_page: int = 40,
                          filters: Optional[Dict[str, str]] = None,
                          order: str = "", search: str = "",
                          max_pages: Optional[int] = None,
-                         delay: Optional[float] = None) -> List[ZotSpotEvent]:
+                         delay: Optional[float] = None,
+                         include_all_events: bool = False,
+                         use_web_filters: bool = False) -> List[ZotSpotEvent]:
         """
         Crawl all events with pagination.
 
         Args:
-            limit_per_page: Number of events per page (max 100 typically)
+            limit_per_page: Number of events per page (default 40, matches web)
             filters: Dict of filter1-filter9 values
             order: Sort order
             search: Search query
             max_pages: Maximum pages to fetch (None = use instance default)
             delay: Deprecated - use instance base_delay instead
+            include_all_events: If True, don't send filter1 (gets all events incl past)
+            use_web_filters: If True, use filter4_contains=OR&filter4_notcontains=OR&order=undefined
 
         Returns:
             List of all ZotSpotEvent objects
@@ -353,30 +382,36 @@ class ZotSpotCrawler:
         all_events = []
         range_start = 0
         page = 0
+        total_count = 0
 
         while True:
             if page >= effective_max_pages:
                 logger.info(f"Reached max pages limit ({effective_max_pages})")
                 break
 
-            events = self.fetch_events_page(
+            events, page_total = self.fetch_events_page(
                 range_start=range_start,
                 limit=limit_per_page,
                 filters=filters,
                 order=order,
-                search=search
+                search=search,
+                include_all_events=include_all_events,
+                use_web_filters=use_web_filters
             )
+
+            if page_total > 0:
+                total_count = page_total
 
             if not events:
                 logger.info("No more events found")
                 break
 
             all_events.extend(events)
-            logger.info(f"Page {page + 1}: Got {len(events)} events (total: {len(all_events)})")
+            logger.info(f"Page {page + 1}: Got {len(events)} events (total: {len(all_events)}/{total_count})")
 
-            # Check if there are more pages
-            if len(events) < limit_per_page:
-                logger.info("Received fewer events than limit - likely last page")
+            # Check if we've fetched all events (using API's counter)
+            if len(all_events) >= total_count:
+                logger.info(f"Fetched all {total_count} events")
                 break
 
             range_start += limit_per_page
@@ -466,15 +501,17 @@ def main():
     parser.add_argument("--jwt", help="JWT token (optional)")
     parser.add_argument("--csrf", help="CSRF token (optional)")
     parser.add_argument("--output", default="zotspot_events.json", help="Output file")
-    parser.add_argument("--limit", type=int, default=50, help="Events per page")
-    parser.add_argument("--max-pages", type=int, help="Max pages to crawl (default: 10)")
+    parser.add_argument("--limit", type=int, default=40, help="Events per page (default: 40, matches web)")
+    parser.add_argument("--max-pages", type=int, help="Max pages to crawl (default: 15)")
     parser.add_argument("--search", default="", help="Search query")
     parser.add_argument("--filter-group", help="Filter by group ID (filter2)")
     parser.add_argument("--filter-category", help="Filter by category (filter3)")
     parser.add_argument("--delay", type=float, default=2.0, help="Base delay between requests in seconds (default: 2.0)")
     parser.add_argument("--max-delay", type=float, default=60.0, help="Max backoff delay in seconds (default: 60.0)")
     parser.add_argument("--timeout", type=int, default=30, help="Request timeout in seconds (default: 30)")
-    parser.add_argument("--fetch-details", type=int, metavar="N", help="Fetch detail pages for first N events (slow!)")
+    parser.add_argument("--fetch-details", type=int, metavar="N", nargs="?", const=0, help="Fetch detail pages for N events (0=all, default: 0)")
+    parser.add_argument("--all-events", action="store_true", help="Include past events (default: upcoming only)")
+    parser.add_argument("--web-filters", action="store_true", help="Use web-like filters (filter4_contains=OR, order=undefined)")
 
     args = parser.parse_args()
 
@@ -507,13 +544,16 @@ def main():
         limit_per_page=args.limit,
         filters=filters if filters else None,
         search=args.search,
-        max_pages=args.max_pages
+        max_pages=args.max_pages,
+        include_all_events=args.all_events,
+        use_web_filters=args.web_filters
     )
 
     # Optionally fetch detail pages
-    if args.fetch_details:
-        logger.info(f"Fetching detail pages for {args.fetch_details} events...")
-        events = crawler.crawl_event_details(events, max_details=args.fetch_details)
+    if args.fetch_details is not None:
+        n = args.fetch_details if args.fetch_details > 0 else None
+        logger.info(f"Fetching detail pages for {n if n else 'all'} events...")
+        events = crawler.crawl_event_details(events, max_details=n)
 
     # Save
     crawler.save_events(events, args.output)
