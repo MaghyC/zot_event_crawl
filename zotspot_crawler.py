@@ -16,6 +16,7 @@ import time
 import random
 import base64
 import requests
+import os
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
 from urllib.parse import urljoin, urlparse
@@ -359,7 +360,8 @@ class ZotSpotCrawler:
                          max_pages: Optional[int] = None,
                          delay: Optional[float] = None,
                          include_all_events: bool = False,
-                         use_web_filters: bool = False) -> List[ZotSpotEvent]:
+                         use_web_filters: bool = False,
+                         resume_file: Optional[str] = None) -> List[ZotSpotEvent]:
         """
         Crawl all events with pagination.
 
@@ -372,17 +374,31 @@ class ZotSpotCrawler:
             delay: Deprecated - use instance base_delay instead
             include_all_events: If True, don't send filter1 (gets all events incl past)
             use_web_filters: If True, use filter4_contains=OR&filter4_notcontains=OR&order=undefined
+            resume_file: Path to JSON file to save/load progress for resume capability
 
         Returns:
             List of all ZotSpotEvent objects
         """
-        # Use instance max_pages as safety limit if not overridden
-        effective_max_pages = max_pages if max_pages is not None else self.max_pages
-
+        # Load progress if resume_file exists
         all_events = []
         range_start = 0
         page = 0
         total_count = 0
+
+        if resume_file and os.path.exists(resume_file):
+            try:
+                with open(resume_file, 'r') as f:
+                    progress = json.load(f)
+                all_events = [ZotSpotEvent(**e) for e in progress.get('events', [])]
+                range_start = progress.get('range_start', 0)
+                page = progress.get('page', 0)
+                total_count = progress.get('total_count', 0)
+                logger.info(f"Resumed from page {page + 1}, range_start={range_start}, {len(all_events)} events loaded")
+            except Exception as e:
+                logger.warning(f"Could not load resume file: {e}")
+
+        # Use instance max_pages as safety limit if not overridden
+        effective_max_pages = max_pages if max_pages is not None else self.max_pages
 
         while True:
             if page >= effective_max_pages:
@@ -409,6 +425,22 @@ class ZotSpotCrawler:
             all_events.extend(events)
             logger.info(f"Page {page + 1}: Got {len(events)} events (total: {len(all_events)}/{total_count})")
 
+            # Save progress
+            if resume_file:
+                try:
+                    progress = {
+                        'events': [asdict(e) for e in all_events],
+                        'range_start': range_start + limit_per_page,
+                        'page': page + 1,
+                        'total_count': total_count,
+                        'timestamp': time.time()
+                    }
+                    with open(resume_file + '.tmp', 'w') as f:
+                        json.dump(progress, f)
+                    os.rename(resume_file + '.tmp', resume_file)
+                except Exception as e:
+                    logger.warning(f"Could not save progress: {e}")
+
             # Check if we've fetched all events (using API's counter)
             if len(all_events) >= total_count:
                 logger.info(f"Fetched all {total_count} events")
@@ -416,6 +448,13 @@ class ZotSpotCrawler:
 
             range_start += limit_per_page
             page += 1
+
+        # Clean up resume file on success
+        if resume_file and os.path.exists(resume_file):
+            try:
+                os.remove(resume_file)
+            except:
+                pass
 
         return all_events
 
@@ -512,6 +551,7 @@ def main():
     parser.add_argument("--fetch-details", type=int, metavar="N", nargs="?", const=0, help="Fetch detail pages for N events (0=all, default: 0)")
     parser.add_argument("--all-events", action="store_true", help="Include past events (default: upcoming only)")
     parser.add_argument("--web-filters", action="store_true", help="Use web-like filters (filter4_contains=OR, order=undefined)")
+    parser.add_argument("--resume", metavar="FILE", help="Resume file path for interrupted crawls")
 
     args = parser.parse_args()
 
@@ -546,7 +586,8 @@ def main():
         search=args.search,
         max_pages=args.max_pages,
         include_all_events=args.all_events,
-        use_web_filters=args.web_filters
+        use_web_filters=args.web_filters,
+        resume_file=args.resume
     )
 
     # Optionally fetch detail pages
