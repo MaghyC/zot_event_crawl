@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Sensitive auth files - NEVER COMMIT
+auth.json
+auth_crawler.json
+*_crawler.json
+*_auth.json
+*.secret
+*.key
+*.token
+
+# Crawler output
+events.json
+zotspot_events.json
+*.events.json
+
+# Logs
+*.log
+crawler.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large HTML files (downloaded reference)
+zotspot.uci.edu.html
+zotspot.uci.edu_files/
+
+# Temporary files
+*.tmp
+*.temp
