@@ -17,10 +17,21 @@ auth_crawler.json
 *.key
 *.token
 
+# Sensitive auth files in new structure
+src/crawlers/auth*.json
+data/clubs/*_crawler.json
+
 # Crawler output
 events.json
 zotspot_events.json
 *.events.json
+data/output/*.json
+!data/output/unified_events.json  # Keep main output
+!data/output/test_events.json     # Keep test files
+
+# Resume/progress files
+data/output/crawl_progress.json
+data/output/*_progress.json
 
 # Logs
 *.log
@@ -40,7 +51,17 @@ Thumbs.db
 # Large HTML files (downloaded reference)
 zotspot.uci.edu.html
 zotspot.uci.edu_files/
+data/raw/zotspot.uci.edu.html
 
 # Temporary files
 *.tmp
 *.temp
+
+# Large raw data files
+data/raw/*.html
+data/raw/*.json
+
+# Coverage
+htmlcov/
+.coverage
+*.cover
